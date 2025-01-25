@@ -1,9 +1,12 @@
+import io
 import os
 import time
 import typing as t
 from uuid import uuid4 as generate_uuid
 
 import discord
+import matplotlib.pyplot as plt
+import numpy as np
 from discord import User
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -19,6 +22,32 @@ assert discord_token is not None, "Discord token is not found"
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+cte = """
+with winners as (
+    select 
+        gs.game_uuid, 
+        gs.user_uuid 
+    from 
+        game_scores gs
+    group by gs.game_uuid having max(gs.score)
+),
+wins_per_game as (
+    select
+        g.uuid as game_uuid,
+        u.username,
+        (select 
+            case 
+                when exists (select * from winners w where w.game_uuid = g.uuid and w.user_uuid = u.uuid) then 1
+                else 0
+            end
+        ) as won
+    from
+        games g
+        join game_scores gs on g.uuid = gs.game_uuid
+        join users u on u.uuid = gs.user_uuid
+)
+"""
 
 
 @bot.tree.command(
@@ -175,6 +204,113 @@ async def log_game(
     connection.commit()
 
     await interaction.response.send_message("Game successfully logged.")
+
+
+@bot.tree.command(
+    name="win_distribution",
+    description="Get the win distribution of all played games so far.",
+)
+async def win_distribution(
+    interaction: discord.Interaction,
+):
+    query = (
+        cte
+        + """
+    select 
+        wpg.username,
+        count(wpg.won) as wins
+    from 
+        wins_per_game wpg
+    where
+        wpg.won = 1
+    group by wpg.username
+    """
+    )
+    winners = cursor.execute(query).fetchall()
+    usernames = [winner[0] for winner in winners]
+    win_count = [winner[1] for winner in winners]
+
+    def make_custom_autopct(values):
+        def autopct_percentages_and_values(pct):
+            total = sum(values)
+            val = int(round(pct * total / 100.0))
+            return "{p:.2f}%  ({v:d})".format(p=pct, v=val)
+
+        return autopct_percentages_and_values
+
+    plt.figure(figsize=(6, 6))
+
+    cmap = plt.get_cmap("tab20")
+    colors = [cmap(i) for i in np.linspace(0, 1, len(win_count))]
+
+    plt.pie(
+        win_count,
+        labels=usernames,
+        autopct=make_custom_autopct(win_count),
+        startangle=90,
+        colors=colors,
+        wedgeprops={"edgecolor": "black", "linewidth": 1, "linestyle": "solid"},
+    )
+
+    plt.title("Win Distribution", fontsize=16, fontweight="bold")
+    plt.axis("equal")  # equal aspect ratio ensures the pie chart is circular.
+
+    buffer = io.BytesIO()
+    plt.savefig(buffer, format="png")
+    buffer.seek(0)
+    plt.close()
+
+    file = discord.File(fp=buffer, filename="win_distribution.png")
+    await interaction.response.send_message(
+        "Here is the win distribution of all games played so far:", file=file
+    )
+
+
+@bot.tree.command(
+    name="win_rate",
+    description="Get the win rate for each player.",
+)
+async def win_rate(
+    interaction: discord.Interaction,
+):
+    query = (
+        cte
+        + """
+    select 
+        wpg.username,
+        avg(won) * 100 as win_rate
+    from 
+        wins_per_game wpg
+    group by wpg.username
+    """
+    )
+    winrates = cursor.execute(query).fetchall()
+    usernames = [winner[0] for winner in winrates]
+    winrate = [winner[1] for winner in winrates]
+
+    cmap = plt.get_cmap("tab20")
+    colors = [cmap(i) for i in np.linspace(0, 1, len(winrate))]
+
+    plt.figure(figsize=(10, 6))
+    plt.bar(usernames, winrate, color=colors)
+
+    plt.title("Win Rate in games played", fontsize=16, fontweight="bold")
+    plt.xlabel("Usernames", fontsize=12)
+    plt.ylabel("Win Rate (Percent)", fontsize=12)
+
+    plt.xticks(rotation=45, ha="right")
+    plt.grid(axis="y", linestyle="--", alpha=0.7)
+
+    buffer = io.BytesIO()
+    plt.savefig(buffer, format="png")
+    buffer.seek(0)
+    plt.close()
+
+    file = discord.File(fp=buffer, filename="win rate.png")
+    await interaction.response.send_message(
+        "Here is the individual win rate for each player (only games played):",
+        file=file,
+    )
 
 
 @bot.event
